@@ -59,10 +59,10 @@ class ReplayBuffer:
 # DQN 智能体
 class DQNAgent:
     def __init__(self, state_dim, action_dim,
-                 learning_rate=0.0001,  # 降低学习率
+                 learning_rate=0.00001,  # 降低学习率
                  gamma=0.99,
                  epsilon=0.9,
-                 epsilon_decay=0.9995,  # 减缓 epsilon 衰减
+                 epsilon_decay=0.9999,  # 减缓 epsilon 衰减
                  epsilon_min=0.01,
                  batch_size=64):
         self.state_dim = state_dim
@@ -273,14 +273,14 @@ def train_dqn_agent(episodes=1000):
             episode_reward += reward  # 累加当前 episode 的回报
             state = next_state
 
-        if episode % 100 == 0:
+        if episode % 10 == 0:
             agent.update_target_network()
 
             # 每100个episode打印一次回报率
             print(f"Episode {episode}/{episodes}, Epsilon: {agent.epsilon:.3f}, Episode Reward: {episode_reward}")
 
         # 每100个episode计算一次胜率
-        if episode % 100 == 0:
+        if episode % 10 == 0:
             win_count = 0
             for i in range(100):
                 state = env.reset()
