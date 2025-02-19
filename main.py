@@ -5,6 +5,7 @@ import numpy as np
 import random
 import pygame
 import sys
+import matplotlib.pyplot as plt
 
 # 检查 GPU 是否可用
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -255,9 +256,13 @@ def train_dqn_agent(episodes=1000):
     action_dim = 81  # 每个位置可能的动作
     agent = DQNAgent(state_dim, action_dim)
 
+    win_count = 0  # 统计胜利次数
+    win_rate = []  # 存储每100个episode的胜率
+
     for episode in range(episodes):
         state = env.reset()
         done = False
+        episode_reward = 0  # 当前 episode 的回报
         while not done:
             action_idx = agent.choose_action(state)  # 获取动作索引
             i = action_idx // 9  # 转换为行
@@ -265,16 +270,44 @@ def train_dqn_agent(episodes=1000):
             next_state, reward, done, info = env.step((i, j))  # 传递元组
             agent.replay_buffer.push((state, action_idx, reward, next_state, done))
             agent.learn()
+            episode_reward += reward  # 累加当前 episode 的回报
             state = next_state
 
         if episode % 100 == 0:
             agent.update_target_network()
-            print(f"Episode {episode}/{episodes}, Epsilon: {agent.epsilon:.3f}")
+
+            # 每100个episode打印一次回报率
+            print(f"Episode {episode}/{episodes}, Epsilon: {agent.epsilon:.3f}, Episode Reward: {episode_reward}")
+
+        # 每100个episode计算一次胜率
+        if episode % 100 == 0:
+            win_count = 0
+            for i in range(100):
+                state = env.reset()
+                done = False
+                while not done:
+                    action_idx = agent.choose_action(state)
+                    i = action_idx // 9
+                    j = action_idx % 9
+                    next_state, reward, done, info = env.step((i, j))
+                    state = next_state
+                if env.winner == 1:  # AI 胜利
+                    win_count += 1
+            win_rate.append(win_count / 100)  # 计算100轮的胜率
+
+    # 绘制胜率图表
+    plt.plot(range(100, episodes+1, 100), win_rate, label="Win Rate")
+    plt.xlabel("Episodes")
+    plt.ylabel("Win Rate")
+    plt.title("Training Win Rate")
+    plt.legend()
+    plt.show()
 
     # 保存训练好的模型
     torch.save(agent.model.state_dict(), "dqn_model.pth")
     print("训练完成！")
     return agent
+
 
 
 # 人机对战界面
