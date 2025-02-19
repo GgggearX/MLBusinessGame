@@ -37,7 +37,7 @@ def create_model(input_dim, output_dim):
 
 # 经验回放池（Experience Replay Buffer）
 class ReplayBuffer:
-    def __init__(self, capacity=10000):
+    def __init__(self, capacity=15000):
         self.buffer = []
         self.capacity = capacity
         self.idx = 0
@@ -250,7 +250,7 @@ class GomokuEnv:
 
 
 # 训练模型
-def train_dqn_agent(episodes=1000):
+def train_dqn_agent(episodes=20000):
     env = GomokuEnv()
     state_dim = 81  # 9x9 五子棋棋盘
     action_dim = 81  # 每个位置可能的动作
@@ -293,10 +293,10 @@ def train_dqn_agent(episodes=1000):
                     state = next_state
                 if env.winner == 1:  # AI 胜利
                     win_count += 1
-            win_rate.append(win_count / 100)  # 计算100轮的胜率
+            win_rate.append(win_count / 10)  # 计算100轮的胜率
 
     # 绘制胜率图表
-    plt.plot(range(100, episodes+1, 100), win_rate, label="Win Rate")
+    plt.plot(range(10, episodes+1, 10), win_rate, label="Win Rate")
     plt.xlabel("Episodes")
     plt.ylabel("Win Rate")
     plt.title("Training Win Rate")
@@ -378,7 +378,7 @@ def play_game(agent):
 if __name__ == '__main__':
     mode = input("请选择模式：1-训练, 2-人机对战 (训练模式将花费较长时间)：")
     if mode.strip() == "1":
-        trained_agent = train_dqn_agent(episodes=1000)
+        trained_agent = train_dqn_agent(episodes=20000)
     else:
         try:
             # 尝试加载预训练模型
@@ -388,5 +388,5 @@ if __name__ == '__main__':
             print("模型加载成功！")
         except FileNotFoundError:
             print("未找到模型，正在训练...")
-            trained_agent = train_dqn_agent(episodes=1000)  # 训练后会保存模型
+            trained_agent = train_dqn_agent(episodes=20000)  # 训练后会保存模型
         play_game(trained_agent)
