@@ -1,7 +1,6 @@
 import os
 import json
 
-
 class Config:
     def __init__(self):
         self.board_size=9
