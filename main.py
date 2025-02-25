@@ -1,446 +1,719 @@
+import os
+import sys
+import json
+import time
+import random
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import random
 import pygame
-import sys
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import time
+from collections import deque
 
-# Rest of your code remains unchanged
-
-# 检查 GPU 是否可用
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark=True
 
+class Config:
+    def __init__(self):
+        self.board_size=9
+        self.win_length=5
+        self.agent_player=1
+        self.episodes=5000
+        self.test_interval=500
+        self.test_games=50
+        self.learning_rate=1e-4
+        self.gamma=0.95
+        self.n_step=3
+        self.multi_step=True
+        self.capacity=200000
+        self.batch_size=256
+        self.update_target_freq=1000
+        self.use_per=True
+        self.per_alpha=0.6
+        self.per_beta_start=0.4
+        self.per_beta_frames=200000
+        self.noisy_net=True
+        self.eps_start=1.0
+        self.eps_min=0.01
+        self.eps_decay=1.0
+        self.use_distributional=True
+        self.atoms=51
+        self.v_min=-10
+        self.v_max=10
+        self.save_model_file="fast_dqn_model.pth"
+        self.save_figure_file="fast_training_curve.png"
+        self.save_config_file="fast_config.json"
+        self.logs_dir="logs_fast"
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
 
-# 定义 Q 网络（深度 Q 网络）
-class QNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 256)  # 增加神经元数量
-        self.fc2 = nn.Linear(256, 256)  # 隐藏层
-        self.fc3 = nn.Linear(256, output_dim)
-        self.relu = nn.ReLU()
+    def save_to_json(self,filename=None):
+        if filename is None:
+            filename=self.save_config_file
+        data=self.__dict__.copy()
+        with open(filename,"w",encoding="utf-8") as f:
+            json.dump(data,f,indent=4)
+        print(f"[Config] Saved to {filename}")
 
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))  # 新增层前向传播
-        x = self.fc3(x)
-        return x
-
-
-# 创建 Q 网络模型和目标网络
-def create_model(input_dim, output_dim):
-    model = QNetwork(input_dim, output_dim).to(device)
-    target_model = QNetwork(input_dim, output_dim).to(device)
-    target_model.load_state_dict(model.state_dict())
-    return model, target_model
-
-
-# 经验回放池（Experience Replay Buffer）
-class ReplayBuffer:
-    def __init__(self, capacity=50000):
-        self.buffer = []
-        self.capacity = capacity
-        self.idx = 0
-
-    def push(self, transition):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.idx] = transition
-        self.idx = (self.idx + 1) % self.capacity
-
-    def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-
-    def size(self):
-        return len(self.buffer)
-
-
-# DQN 智能体
-class DQNAgent:
-    def __init__(self, state_dim, action_dim,
-                 learning_rate=0.0001,
-                 gamma=0.95,
-                 epsilon=0.9,
-                 epsilon_decay=0.999,
-                 epsilon_min=0.01,
-                 batch_size=64):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.learning_rate = learning_rate
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
-        self.batch_size = batch_size
-        self.model, self.target_model = create_model(state_dim, action_dim)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        self.loss_fn = nn.MSELoss()
-        self.replay_buffer = ReplayBuffer()
-        self.loss_history = []  # 新增：记录每次学习的损失
-
-    def choose_action(self, state, env=None):
-        if random.random() < self.epsilon:
-            available = env.available_actions() if env else [(i, j) for i in range(9) for j in range(9)]
-            i, j = random.choice(available)
-            return i * 9 + j
-        else:
-            state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-            q_values = self.model(state)
-            return torch.argmax(q_values).item()
-
-    def learn(self):
-        if self.replay_buffer.size() < self.batch_size:
+    def load_from_json(self,filename=None):
+        if filename is None:
+            filename=self.save_config_file
+        if not os.path.isfile(filename):
+            print(f"[Config] {filename} not found, skip load")
             return
+        with open(filename,"r",encoding="utf-8") as f:
+            data=json.load(f)
+            for k,v in data.items():
+                setattr(self,k,v)
+        print(f"[Config] Loaded from {filename}")
 
-        transitions = self.replay_buffer.sample(self.batch_size)
-        batch = list(zip(*transitions))
-        state_batch = torch.tensor(batch[0], dtype=torch.float32).to(device)
-        action_batch = torch.tensor(batch[1], dtype=torch.long).to(device)
-        reward_batch = torch.tensor(batch[2], dtype=torch.float32).to(device)
-        next_state_batch = torch.tensor(batch[3], dtype=torch.float32).to(device)
-        done_batch = torch.tensor(batch[4], dtype=torch.float32).to(device)
+class Logger:
+    def __init__(self,config):
+        self.config=config
+        self.log_file=os.path.join(config.logs_dir,"train.log")
+        self.start_time=time.time()
+        self.buffer=[]
+    def log(self,msg,print_msg=True):
+        elapsed=time.time()-self.start_time
+        line=f"[{elapsed:7.2f}s] {msg}"
+        if print_msg:
+            print(line)
+        self.buffer.append(line)
+    def save_log(self):
+        with open(self.log_file,"a",encoding="utf-8") as f:
+            for line in self.buffer:
+                f.write(line+"\n")
+        self.buffer=[]
 
-        q_values = self.model(state_batch)
-        q_value = q_values.gather(1, action_batch.unsqueeze(1)).squeeze(1)
+class Plotter:
+    @staticmethod
+    def plot_curve(data_list,label,title,save_file):
+        plt.figure()
+        plt.plot(data_list,label=label)
+        plt.title(title)
+        plt.legend()
+        plt.savefig(save_file)
+        plt.close()
 
-        with torch.no_grad():
-            next_q_values = self.target_model(next_state_batch)
-            next_q_value = next_q_values.max(1)[0]
-            target = reward_batch + self.gamma * next_q_value * (1 - done_batch)
-
-        loss = self.loss_fn(q_value, target)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        self.loss_history.append(loss.item())  # 记录损失，不打印
-
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-    def update_target_network(self):
-        self.target_model.load_state_dict(self.model.state_dict())
-        print("Target network updated.")  # 可选：保留但减少频率
-
-
-# 游戏环境（五子棋）
 class GomokuEnv:
-    def __init__(self, board_size=9, win_length=5):
-        self.board_size = board_size
-        self.win_length = win_length
+    def __init__(self,board_size=9,win_length=5,agent_player=1):
+        self.board_size=board_size
+        self.win_length=win_length
+        self.agent_player=agent_player
         self.reset()
 
     def reset(self):
-        self.board = np.zeros((self.board_size, self.board_size), dtype=int)
-        self.current_player = 1
-        self.done = False
-        self.winner = None
-        return self.get_state()
-
-    def get_state(self):
+        self.board=np.zeros((self.board_size,self.board_size),dtype=int)
+        self.current_player=1
+        self.done=False
+        self.winner=None
         return tuple(self.board.flatten())
 
     def available_actions(self):
-        actions = []
+        acts=[]
         for i in range(self.board_size):
             for j in range(self.board_size):
-                if self.board[i, j] == 0:
-                    actions.append((i, j))
-        return actions
+                if self.board[i,j]==0:
+                    acts.append((i,j))
+        return acts
 
-    def step(self, action):
-        i, j = action  # action 是一个 (i, j) 元组
+    def step(self,action):
+        i,j=action
         if self.done:
-            return self.get_state(), 0, True, {}
+            return self._get_state(),0.0,True,{}
+        if not(0<=i<self.board_size and 0<=j<self.board_size):
+            self.done=True
+            return self._get_state(),-1.0,True,{"illegal_move":True}
+        if self.board[i,j]!=0:
+            self.done=True
+            return self._get_state(),-1.0,True,{"illegal_move":True}
+        self.board[i,j]=self.current_player
+        if self._check_winner(i,j):
+            self.done=True
+            self.winner=self.current_player
+            if self.current_player==self.agent_player:
+                return self._get_state(),10.0,True,{}
+            else:
+                return self._get_state(),-10.0,True,{}
+        if len(self.available_actions())==0:
+            self.done=True
+            return self._get_state(),0.0,True,{}
 
-        if self.board[i, j] != 0:
-            return self.get_state(), -1, True, {'illegal_move': True}
+        reward=self._calc_connected_reward(i,j)
+        self.current_player=3-self.current_player
+        return self._get_state(),reward,False,{}
 
-        self.board[i, j] = self.current_player
-        if self.check_winner(i, j):
-            self.done = True
-            self.winner = self.current_player
-            return self.get_state(), 1 if self.current_player == 1 else -1, True, {}
-
-        if len(self.available_actions()) == 0:
-            self.done = True
-            return self.get_state(), 0, True, {}
-
-        self.current_player = 3 - self.current_player
-        return self.get_state(), 0, False, {}
-
-    def check_winner(self, row, col):
-        player = self.board[row, col]
-        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
-        for d in directions:
-            count = 1
-            i, j = row + d[0], col + d[1]
-            while 0 <= i < self.board_size and 0 <= j < self.board_size and self.board[i, j] == player:
-                count += 1
-                i += d[0]
-                j += d[1]
-            i, j = row - d[0], col - d[1]
-            while 0 <= i < self.board_size and 0 <= j < self.board_size and self.board[i, j] == player:
-                count += 1
-                i -= d[0]
-                j -= d[1]
-            if count >= self.win_length:
+    def _check_winner(self,row,col):
+        p=self.board[row,col]
+        dirs=[(1,0),(0,1),(1,1),(1,-1)]
+        for d in dirs:
+            c=1
+            x,y=row+d[0],col+d[1]
+            while 0<=x<self.board_size and 0<=y<self.board_size and self.board[x,y]==p:
+                c+=1
+                x+=d[0]
+                y+=d[1]
+            x,y=row-d[0],col-d[1]
+            while 0<=x<self.board_size and 0<=y<self.board_size and self.board[x,y]==p:
+                c+=1
+                x-=d[0]
+                y-=d[1]
+            if c>=self.win_length:
                 return True
         return False
 
-    def step(self, action):
-        i, j = action  # action 是一个 (i, j) 元组
-        if self.done:
-            return self.get_state(), 0, True, {}
+    def _calc_connected_reward(self,row,col):
+        p=self.board[row,col]
+        o=3-p
+        dirs=[(1,0),(0,1),(1,1),(1,-1)]
+        max_conn=1
+        opp_conn=1
+        for d in dirs:
+            c=1
+            x,y=row+d[0],col+d[1]
+            while 0<=x<self.board_size and 0<=y<self.board_size and self.board[x,y]==p:
+                c+=1
+                x+=d[0]
+                y+=d[1]
+            x,y=row-d[0],col-d[1]
+            while 0<=x<self.board_size and 0<=y<self.board_size and self.board[x,y]==p:
+                c+=1
+                x-=d[0]
+                y-=d[1]
+            max_conn=max(max_conn,c)
+            c2=1
+            xx,yy=row+d[0],col+d[1]
+            while 0<=xx<self.board_size and 0<=yy<self.board_size and self.board[xx,yy]==o:
+                c2+=1
+                xx+=d[0]
+                yy+=d[1]
+            xx,yy=row-d[0],col-d[1]
+            while 0<=xx<self.board_size and 0<=yy<self.board_size and self.board[xx,yy]==o:
+                c2+=1
+                xx-=d[0]
+                yy-=d[1]
+            opp_conn=max(opp_conn,c2)
+        reward=0.0
+        if max_conn==2:
+            reward+=0.3
+        elif max_conn==3:
+            reward+=0.6
+        elif max_conn==4:
+            reward+=1.0
+        if opp_conn==2:
+            reward-=0.3
+        elif opp_conn==3:
+            reward-=0.6
+        elif opp_conn==4:
+            reward-=1.0
+        return reward
 
-        if self.board[i, j] != 0:
-            return self.get_state(), -1, True, {'illegal_move': True}
+    def _get_state(self):
+        return tuple(self.board.flatten())
 
-        self.board[i, j] = self.current_player
-        if self.check_winner(i, j):
-            self.done = True
-            self.winner = self.current_player
-            return self.get_state(), 1 if self.current_player == 1 else -1, True, {}
-
-        if len(self.available_actions()) == 0:
-            self.done = True
-            return self.get_state(), 0, True, {}
-
-        # 计算启发式奖励
-        heuristic_reward = self.calculate_heuristic_reward(i, j)
-
-        self.current_player = 3 - self.current_player
-        return self.get_state(), heuristic_reward, False, {}
-
-    def calculate_heuristic_reward(self, row, col):
-        """计算启发式奖励，根据连子数量"""
-        player = self.board[row, col]
-        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]  # 四个方向：水平、垂直、两条对角线
-        max_connected = 0
-
-        # 检查每个方向的连子数量
-        for d in directions:
-            count = 1  # 包括当前落子
-            # 正方向
-            i, j = row + d[0], col + d[1]
-            while 0 <= i < self.board_size and 0 <= j < self.board_size and self.board[i, j] == player:
-                count += 1
-                i += d[0]
-                j += d[1]
-            # 反方向
-            i, j = row - d[0], col - d[1]
-            while 0 <= i < self.board_size and 0 <= j < self.board_size and self.board[i, j] == player:
-                count += 1
-                i -= d[0]
-                j -= d[1]
-            max_connected = max(max_connected, count)
-
-        # 根据连子数量返回奖励
-        if max_connected >= 4:
-            return 0.5  # 接近胜利
-        elif max_connected == 3:
-            return 0.2  # 有潜力
-        elif max_connected == 2:
-            return 0.1  # 小进展
-        return 0  # 无特别进展
-
-    # 修改 GomokuEnv 的 render 方法
-    def render(self, screen, cell_size=50):
-        # 修改背景颜色和网格颜色
-        screen.fill((245, 222, 179))  # 米白色背景
-
-        # 绘制更粗的网格线
+    def render(self,screen,cell_size=50):
+        screen.fill((245,222,179))
         for i in range(self.board_size):
-            pygame.draw.line(screen, (139, 69, 19),  # 深棕色线条
-                             (0, i * cell_size + cell_size // 2),
-                             (self.board_size * cell_size, i * cell_size + cell_size // 2),
-                             3)
-            pygame.draw.line(screen, (139, 69, 19),
-                             (i * cell_size + cell_size // 2, 0),
-                             (i * cell_size + cell_size // 2, self.board_size * cell_size),
-                             3)
-
-        # 添加棋盘星位标记
-        star_points = [(2, 2), (2, 6), (6, 2), (6, 6), (4, 4)]
-        for (i, j) in star_points:
-            pygame.draw.circle(screen, (139, 69, 19),
-                               (j * cell_size + cell_size // 2, i * cell_size + cell_size // 2),
-                               5)
-
-        # 美化棋子样式
+            pygame.draw.line(screen,(139,69,19),
+                             (0,i*cell_size+cell_size//2),
+                             (self.board_size*cell_size,i*cell_size+cell_size//2),3)
+            pygame.draw.line(screen,(139,69,19),
+                             (i*cell_size+cell_size//2,0),
+                             (i*cell_size+cell_size//2,self.board_size*cell_size),3)
         for i in range(self.board_size):
             for j in range(self.board_size):
-                if self.board[i, j] == 1:
-                    # 为黑棋添加光泽效果
-                    pygame.draw.circle(screen, (50, 50, 50),
-                                       (j * cell_size + cell_size // 2, i * cell_size + cell_size // 2),
-                                       cell_size // 2 - 4)
-                    pygame.draw.circle(screen, (100, 100, 100),
-                                       (j * cell_size + cell_size // 2 + 2, i * cell_size + cell_size // 2 - 2),
-                                       8)
-                elif self.board[i, j] == 2:
-                    # 为白棋添加渐变效果
-                    pygame.draw.circle(screen, (200, 0, 0),
-                                       (j * cell_size + cell_size // 2, i * cell_size + cell_size // 2),
-                                       cell_size // 2 - 4)
-                    pygame.draw.circle(screen, (255, 100, 100),
-                                       (j * cell_size + cell_size // 2 + 2, i * cell_size + cell_size // 2 - 2),
-                                       8)
+                if self.board[i,j]==1:
+                    pygame.draw.circle(screen,(50,50,50),
+                                       (j*cell_size+cell_size//2,i*cell_size+cell_size//2),
+                                       cell_size//2-4)
+                elif self.board[i,j]==2:
+                    pygame.draw.circle(screen,(200,0,0),
+                                       (j*cell_size+cell_size//2,i*cell_size+cell_size//2),
+                                       cell_size//2-4)
         pygame.display.flip()
 
+class ReplayBuffer:
+    def __init__(self,capacity=100000):
+        self.capacity=capacity
+        self.buffer=[]
+        self.pos=0
+    def push(self,transition):
+        if len(self.buffer)<self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos]=transition
+        self.pos=(self.pos+1)%self.capacity
+    def sample(self,batch_size):
+        return random.sample(self.buffer,batch_size)
+    def size(self):
+        return len(self.buffer)
 
-# 训练模型
-def train_dqn_agent(episodes=50000):
-    env = GomokuEnv()
-    state_dim = 81
-    action_dim = 81
-    agent = DQNAgent(state_dim, action_dim)
-    win_rate = []
-    reward_history = []
+class PrioritizedReplayBuffer:
+    def __init__(self,capacity=100000,alpha=0.6,beta_start=0.4,beta_frames=200000):
+        self.capacity=capacity
+        self.alpha=alpha
+        self.beta_start=beta_start
+        self.beta_frames=beta_frames
+        self.buffer=[]
+        self.pos=0
+        self.priorities=np.zeros((capacity,),dtype=np.float32)
+        self.frame=1
+    def _beta_by_frame(self):
+        return min(1.0,self.beta_start+(1.0-self.beta_start)*self.frame/self.beta_frames)
+    def push(self,transition,td_error=1.0):
+        max_prio=self.priorities.max() if len(self.buffer)>0 else 1.0
+        if len(self.buffer)<self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos]=transition
+        self.priorities[self.pos]=max(max_prio,td_error)
+        self.pos=(self.pos+1)%self.capacity
+    def sample(self,batch_size):
+        if len(self.buffer)==0:
+            return [],[],torch.zeros(0)
+        if len(self.buffer)==self.capacity:
+            prios=self.priorities
+        else:
+            prios=self.priorities[:len(self.buffer)]
+        probs=prios**self.alpha
+        probs/=probs.sum()
+        indices=np.random.choice(len(self.buffer),batch_size,p=probs)
+        beta=self._beta_by_frame()
+        self.frame+=1
+        weights=(len(self.buffer)*probs[indices])**(-beta)
+        weights/=weights.max()
+        batch=[self.buffer[idx]for idx in indices]
+        return batch,indices,torch.FloatTensor(weights).to(device)
+    def update_priorities(self,indices,new_prios):
+        for idx,prio in zip(indices,new_prios):
+            self.priorities[idx]=prio
+    def size(self):
+        return len(self.buffer)
 
-    for episode in range(episodes):
-        state = env.reset()
-        done = False
-        episode_reward = 0
+class MultiStepWrapper:
+    def __init__(self,n_step=3,gamma=0.99):
+        self.n_step=n_step
+        self.gamma=gamma
+        self.buffer=deque()
+    def append(self,transition):
+        self.buffer.append(transition)
+    def get_ready(self):
+        return len(self.buffer)>=self.n_step
+    def flush(self):
+        self.buffer.clear()
+    def pop(self):
+        R=0.0
+        for i,(s,a,r,ns,d) in enumerate(self.buffer):
+            R+=(self.gamma**i)*r
+        s0,a0,_,_,_=self.buffer[0]
+        _,_,_,s_n,done_n=self.buffer[-1]
+        return (s0,a0,R,s_n,done_n)
 
-        while not done:
-            action_idx = agent.choose_action(state, env)
-            i, j = action_idx // 9, action_idx % 9
-            next_state, reward, done, info = env.step((i, j))
-            agent.replay_buffer.push((state, action_idx, reward, next_state, done))
-            agent.learn()
-            episode_reward += reward
-            state = next_state
+class NoisyLinear(nn.Module):
+    def __init__(self,in_features,out_features,sigma_init=0.5):
+        super().__init__()
+        self.in_features=in_features
+        self.out_features=out_features
+        self.weight_mu=nn.Parameter(torch.FloatTensor(out_features,in_features))
+        self.weight_sigma=nn.Parameter(torch.FloatTensor(out_features,in_features))
+        self.register_buffer("weight_epsilon",torch.FloatTensor(out_features,in_features))
+        self.bias_mu=nn.Parameter(torch.FloatTensor(out_features))
+        self.bias_sigma=nn.Parameter(torch.FloatTensor(out_features))
+        self.register_buffer("bias_epsilon",torch.FloatTensor(out_features))
+        self.sigma_init=sigma_init
+        self.reset_parameters()
+        self.reset_noise()
+    def reset_parameters(self):
+        mu_range=1/math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range,mu_range)
+        self.weight_sigma.data.fill_(self.sigma_init*mu_range)
+        self.bias_mu.data.uniform_(-mu_range,mu_range)
+        self.bias_sigma.data.fill_(self.sigma_init*mu_range)
+    def reset_noise(self):
+        eps_in=torch.randn(self.in_features)
+        eps_out=torch.randn(self.out_features)
+        eps_in=eps_in.sign().mul_(eps_in.abs().sqrt_())
+        eps_out=eps_out.sign().mul_(eps_out.abs().sqrt_())
+        self.weight_epsilon.copy_(eps_out.outer(eps_in))
+        self.bias_epsilon.copy_(eps_out)
+    def forward(self,x):
+        if self.training:
+            w=self.weight_mu+self.weight_sigma*self.weight_epsilon
+            b=self.bias_mu+self.bias_sigma*self.bias_epsilon
+        else:
+            w=self.weight_mu
+            b=self.bias_mu
+        return nn.functional.linear(x,w,b)
 
-        reward_history.append(episode_reward)
+class FastDuelingNoisyNet(nn.Module):
+    def __init__(self,config):
+        super().__init__()
+        self.config=config
+        self.board_size=config.board_size
+        self.atoms=config.atoms if config.use_distributional else 1
+        self.v_min=config.v_min
+        self.v_max=config.v_max
+        self.conv1=nn.Conv2d(1,16,3,1,1)
+        self.conv2=nn.Conv2d(16,32,3,1,1)
+        self.fc=nn.Sequential(
+            nn.Linear(32*self.board_size*self.board_size,128),
+            nn.ReLU()
+        )
+        if config.noisy_net:
+            self.value_stream=nn.Sequential(
+                NoisyLinear(128,128),
+                nn.ReLU(),
+                NoisyLinear(128,self.atoms)
+            )
+            self.adv_stream=nn.Sequential(
+                NoisyLinear(128,128),
+                nn.ReLU(),
+                NoisyLinear(128,self.board_size*self.board_size*self.atoms)
+            )
+        else:
+            self.value_stream=nn.Sequential(
+                nn.Linear(128,128),
+                nn.ReLU(),
+                nn.Linear(128,self.atoms)
+            )
+            self.adv_stream=nn.Sequential(
+                nn.Linear(128,128),
+                nn.ReLU(),
+                nn.Linear(128,self.board_size*self.board_size*self.atoms)
+            )
+    def forward(self,x):
+        x=x.view(-1,1,self.board_size,self.board_size)
+        x=nn.functional.relu(self.conv1(x))
+        x=nn.functional.relu(self.conv2(x))
+        x=x.view(x.size(0),-1)
+        x=self.fc(x)
+        v=self.value_stream(x).view(-1,1,self.atoms)
+        a=self.adv_stream(x).view(-1,self.board_size*self.board_size,self.atoms)
+        mean_a=a.mean(dim=1,keepdim=True)
+        q=v+a-mean_a
+        if self.config.use_distributional:
+            q=nn.functional.softmax(q,dim=2)
+        return q
+    def reset_noise(self):
+        if not self.config.noisy_net:
+            return
+        for m in self.modules():
+            if isinstance(m,NoisyLinear):
+                m.reset_noise()
 
-        if episode % 100 == 0 and episode > 0:
-            agent.update_target_network()
-            avg_loss = np.mean(agent.loss_history[-1000:]) if agent.loss_history else 0
-            avg_reward = np.mean(reward_history[-100:])
-            win_count = 0
+class DQNAgent:
+    def __init__(self,config):
+        self.config=config
+        self.gamma=config.gamma
+        self.n_step=config.n_step
+        self.use_per=config.use_per
+        self.use_distributional=config.use_distributional
+        self.v_min=config.v_min
+        self.v_max=config.v_max
+        self.atoms=config.atoms if config.use_distributional else 1
+        self.support=torch.linspace(self.v_min,self.v_max,self.atoms).to(device)
+        self.online_net=FastDuelingNoisyNet(config).to(device)
+        self.target_net=FastDuelingNoisyNet(config).to(device)
+        self.target_net.load_state_dict(self.online_net.state_dict())
+        self.optimizer=optim.Adam(self.online_net.parameters(),lr=config.learning_rate)
+        if self.use_per:
+            self.replay=PrioritizedReplayBuffer(config.capacity,config.per_alpha,config.per_beta_start,config.per_beta_frames)
+        else:
+            self.replay=ReplayBuffer(config.capacity)
+        if config.multi_step:
+            self.multi_step_buffer=MultiStepWrapper(config.n_step,config.gamma)
+        else:
+            self.multi_step_buffer=None
+        self.update_count=0
+        self.eps=config.eps_start
+        self.eps_min=config.eps_min
+        self.eps_decay=config.eps_decay
+        self.losses=[]
+        self.learn_every=4
+        self.learn_counter=0
 
-            for _ in range(100):
-                state = env.reset()
-                done = False
-                while not done:
-                    action_idx = agent.choose_action(state, env)
-                    i, j = action_idx // 9, action_idx % 9
-                    next_state, reward, done, _ = env.step((i, j))
-                    state = next_state
-                if env.winner == 1:
-                    win_count += 1
-            current_win_rate = win_count / 100
-            win_rate.append(current_win_rate)
+    def choose_action(self,state,env=None):
+        if self.config.noisy_net:
+            eps_explore=0.0
+        else:
+            eps_explore=self.eps
+        board_size=self.config.board_size
+        if env:
+            valid_moves=env.available_actions()
+        else:
+            valid_moves=[(i,j) for i in range(board_size) for j in range(board_size)]
+        if not valid_moves:
+            return 0
+        if random.random()<eps_explore:
+            i,j=random.choice(valid_moves)
+            return i*board_size+j
+        else:
+            with torch.no_grad():
+                s=torch.FloatTensor(state).unsqueeze(0).to(device)
+                pmf=self.online_net(s)
+                if self.use_distributional:
+                    q_values=(pmf*self.support.view(1,1,self.atoms)).sum(dim=2)
+                else:
+                    q_values=pmf.squeeze(-1)
+                q_values=q_values[0].cpu().numpy()
+            for idx in range(board_size*board_size):
+                ii=idx//board_size
+                jj=idx%board_size
+                if (ii,jj) not in valid_moves:
+                    q_values[idx]=-1e9
+            return int(np.argmax(q_values))
 
-            progress = episode / episodes * 100
-            print(f"{'-' * 50}")
-            print(f"Episode: {episode}/{episodes} ({progress:.1f}%)")
-            print(f"Epsilon: {agent.epsilon:.4f}")
-            print(f"Avg Loss (last 1000 steps): {avg_loss:.4f}")
-            print(f"Avg Reward (last 100 episodes): {avg_reward:.2f}")
-            print(f"Win Rate (last 100 tests): {current_win_rate:.2%}")
-            print(f"{'-' * 50}")
+    def store(self,s,a,r,ns,done):
+        if self.multi_step_buffer:
+            self.multi_step_buffer.append((s,a,r,ns,done))
+            if self.multi_step_buffer.get_ready():
+                s0,a0,R,s_n,done_n=self.multi_step_buffer.pop()
+                self._push_to_buffer(s0,a0,R,s_n,done_n)
+            if done:
+                self.multi_step_buffer.flush()
+        else:
+            self._push_to_buffer(s,a,r,ns,done)
 
-    # Replace plt.show() with saving to a file
-    plt.plot(range(100, episodes, 100), win_rate, label="Win Rate")
-    plt.xlabel("Episodes")
-    plt.ylabel("Win Rate")
-    plt.title("Training Win Rate")
-    plt.legend()
-    plt.savefig("training_win_rate.png")  # Save plot as an image
-    plt.close()  # Close the figure to free memory
+    def _push_to_buffer(self,s,a,r,ns,done):
+        if self.use_per:
+            self.replay.push((s,a,r,ns,done),td_error=1.0)
+        else:
+            self.replay.push((s,a,r,ns,done))
 
-    timestamp = int(time.time())
-    filename = f"dqn_model_{timestamp}.pth"
-    torch.save(agent.model.state_dict(), filename)
-    print(f"训练完成！模型保存为 {filename}")
+    def update_target(self):
+        self.target_net.load_state_dict(self.online_net.state_dict())
 
-    return agent
+    def learn(self,episode,ep_reward):
+        self.learn_counter+=1
+        if self.learn_counter%self.learn_every!=0:
+            return
+        if self.replay.size()<self.config.batch_size:
+            return
+        if self.use_per:
+            transitions,indices,weights=self.replay.sample(self.config.batch_size)
+        else:
+            transitions=self.replay.sample(self.config.batch_size)
+            weights=torch.ones(self.config.batch_size,device=device)
+            indices=None
+        batch=list(zip(*transitions))
+        s_batch=torch.FloatTensor(batch[0]).to(device)
+        a_batch=torch.LongTensor(batch[1]).to(device)
+        r_batch=torch.FloatTensor(batch[2]).to(device)
+        ns_batch=torch.FloatTensor(batch[3]).to(device)
+        d_batch=torch.FloatTensor(batch[4]).to(device)
+        if self.use_distributional:
+            self._distributional_update(s_batch,a_batch,r_batch,ns_batch,d_batch,weights,indices)
+        else:
+            self._classic_update(s_batch,a_batch,r_batch,ns_batch,d_batch,weights,indices)
+        self.update_count+=1
+        if self.update_count%10==0:
+            print(f"[Learn {self.update_count}] Ep={episode} R={ep_reward:.2f} Size={self.replay.size()} Loss={self.losses[-1]:.4f} Eps={self.eps:.4f}")
+        if self.update_count%self.config.update_target_freq==0:
+            self.update_target()
+        if not self.config.noisy_net and self.eps>self.eps_min:
+            self.eps*=self.eps_decay
+        self.online_net.reset_noise()
+        self.target_net.reset_noise()
 
+    def _classic_update(self,s,a,r,ns,d,weights,indices):
+        with torch.no_grad():
+            q_online_next=self.online_net(ns).squeeze(-1)
+            a_next=q_online_next.argmax(dim=1)
+            q_target_next=self.target_net(ns).squeeze(-1)
+            q_next=q_target_next.gather(1,a_next.unsqueeze(1)).squeeze(1)
+            y=r+self.gamma*q_next*(1-d)
+        q_pred_all=self.online_net(s).squeeze(-1)
+        q_pred=q_pred_all.gather(1,a.unsqueeze(1)).squeeze(1)
+        loss=(weights*(q_pred-y).pow(2)).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.online_net.parameters(),10.0)
+        self.optimizer.step()
+        self.losses.append(loss.item())
+        if self.use_per and indices is not None:
+            prios=(q_pred-y).abs().detach().cpu().numpy()+1e-6
+            self.replay.update_priorities(indices,prios)
 
-# 人机对战界面
-def play_game(agent):
+    def _distributional_update(self,s,a,r,ns,d,weights,indices):
+        bs=s.size(0)
+        with torch.no_grad():
+            p_online_ns=self.online_net(ns)
+            q_online_ns=(p_online_ns*self.support.view(1,1,self.atoms)).sum(dim=2)
+            a_next=q_online_ns.argmax(dim=1)
+            p_target_ns=self.target_net(ns)
+            p_target_a=p_target_ns[range(bs),a_next]
+        Tz=r.unsqueeze(1)+self.gamma*(1-d).unsqueeze(1)*self.support.unsqueeze(0)
+        Tz=Tz.clamp(self.v_min,self.v_max)
+        b=(Tz-self.v_min)/((self.v_max-self.v_min)/(self.atoms-1))
+        l=b.floor().long().clamp(0,self.atoms-1)
+        u=b.ceil().long().clamp(0,self.atoms-1)
+        m=torch.zeros(bs,self.atoms,device=device)
+        for i in range(bs):
+            for j in range(self.atoms):
+                pj=p_target_a[i,j]
+                lj=l[i,j]
+                uj=u[i,j]
+                m[i,lj]+=pj*(uj.float()-b[i,j])
+                m[i,uj]+=pj*(b[i,j]-lj.float())
+        p_out=self.online_net(s)
+        p_act=p_out[range(bs),a]
+        p_act=p_act.clamp(min=1e-5,max=1.0)
+        loss_all=-(m*p_act.log()).sum(dim=1)
+        prios=loss_all.detach().cpu().numpy()+1e-6
+        loss=(loss_all*weights).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.online_net.parameters(),10.0)
+        self.optimizer.step()
+        self.losses.append(loss.item())
+        if self.use_per and indices is not None:
+            self.replay.update_priorities(indices,prios)
+
+class Trainer:
+    def __init__(self,config,logger):
+        self.config=config
+        self.logger=logger
+        self.env=GomokuEnv(config.board_size,config.win_length,config.agent_player)
+        self.agent=DQNAgent(config)
+        self.reward_history=[]
+        self.win_rate_history=[]
+        self.loss_history=self.agent.losses
+
+    def train(self):
+        self.logger.log(f"Start Training: episodes={self.config.episodes}, batch_size={self.config.batch_size}",True)
+        for ep in range(1,self.config.episodes+1):
+            s=self.env.reset()
+            done=False
+            ep_reward=0.0
+            while not done:
+                if self.env.current_player==self.config.agent_player:
+                    a_idx=self.agent.choose_action(s,self.env)
+                    i,j=divmod(a_idx,self.config.board_size)
+                    ns,r,done,_=self.env.step((i,j))
+                    self.agent.store(s,a_idx,r,ns,done)
+                    self.agent.learn(ep,ep_reward)
+                    s=ns
+                    ep_reward+=r
+                else:
+                    acts=self.env.available_actions()
+                    if not acts:
+                        break
+                    op=random.choice(acts)
+                    ns,r,done,_=self.env.step(op)
+                    s=ns
+            self.reward_history.append(ep_reward)
+            if ep%self.config.test_interval==0:
+                w_rate=self.test_agent(self.config.test_games)
+                self.win_rate_history.append(w_rate)
+                avg_loss=np.mean(self.loss_history[-100:]) if len(self.loss_history)>100 else (np.mean(self.loss_history) if len(self.loss_history)>0 else 0.0)
+                avg_reward=np.mean(self.reward_history[-100:]) if len(self.reward_history)>100 else np.mean(self.reward_history)
+                self.logger.log(
+                    f"Episode {ep}/{self.config.episodes} WinRate={w_rate*100:.1f}% AvgR(100)={avg_reward:.2f} AvgL(100)={avg_loss:.4f} Eps={self.agent.eps:.4f}"
+                )
+        self.logger.log("Training done.")
+        torch.save(self.agent.online_net.state_dict(),self.config.save_model_file)
+        self.logger.log(f"Saved model to {self.config.save_model_file}")
+        self.logger.save_log()
+        Plotter.plot_curve(self.loss_history,"Loss","Training Loss",self.config.save_figure_file)
+
+    def test_agent(self,episodes=50):
+        wins=0
+        for _ in range(episodes):
+            s=self.env.reset()
+            done=False
+            while not done:
+                if self.env.current_player==self.config.agent_player:
+                    a_idx=self.agent.choose_action(s,self.env)
+                    i,j=divmod(a_idx,self.config.board_size)
+                    s,r,done,_=self.env.step((i,j))
+                else:
+                    acts=self.env.available_actions()
+                    if not acts:
+                        break
+                    op=random.choice(acts)
+                    s,r,done,_=self.env.step(op)
+            if self.env.winner==self.config.agent_player:
+                wins+=1
+        return wins/episodes
+
+def play_game(config):
     pygame.init()
-    board_size = 9
-    cell_size = 50
-    width = cell_size * board_size
-    height = cell_size * board_size
-    screen = pygame.display.set_mode((width, height))
-    pygame.display.set_caption("五子棋 - 人机对战 (黑子：智能体，红子：玩家)")
-
-    env = GomokuEnv(board_size=board_size)
-    state = env.reset()
-
-    running = True
-    clock = pygame.time.Clock()
-
+    board_size=config.board_size
+    cell_size=50
+    width=board_size*cell_size
+    height=board_size*board_size
+    screen=pygame.display.set_mode((board_size*cell_size,board_size*cell_size))
+    env=GomokuEnv(board_size,config.win_length,config.agent_player)
+    s=env.reset()
+    agent=DQNAgent(config)
+    if os.path.isfile(config.save_model_file):
+        agent.online_net.load_state_dict(torch.load(config.save_model_file,map_location=device))
+        agent.online_net.eval()
+        agent.target_net.load_state_dict(agent.online_net.state_dict())
+        agent.target_net.eval()
+        print(f"Loaded model from {config.save_model_file}")
+    else:
+        print(f"Model not found: {config.save_model_file}, train first.")
+        pygame.quit()
+        return
+    running=True
+    clock=pygame.time.Clock()
     while running:
-        env.render(screen, cell_size=cell_size)
+        env.render(screen,cell_size)
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
+            if event.type==pygame.QUIT:
+                running=False
                 break
-            if event.type == pygame.MOUSEBUTTONDOWN and env.current_player == 2:
-                pos = pygame.mouse.get_pos()
-                x, y = pos
-                j = x // cell_size
-                i = y // cell_size
-                if (i, j) in env.available_actions():
-                    state, reward, done, info = env.step((i, j))
-
-        if env.current_player == 1 and not env.done:
-            action_idx = agent.choose_action(state)  # 获取动作索引
-            i = action_idx // 9
-            j = action_idx % 9
-            state, reward, done, info = env.step((i, j))
-
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                if env.current_player!=config.agent_player and not env.done:
+                    pos=pygame.mouse.get_pos()
+                    x,y=pos
+                    j=x//cell_size
+                    i=y//cell_size
+                    if 0<=i<board_size and 0<=j<board_size and env.board[i,j]==0 and not env.done:
+                        s,r,dn,_=env.step((i,j))
+        if env.current_player==config.agent_player and not env.done:
+            a_idx=agent.choose_action(s,env)
+            i,j=divmod(a_idx,board_size)
+            if 0<=i<board_size and 0<=j<board_size and env.board[i,j]==0:
+                s,r,dn,_=env.step((i,j))
         if env.done:
-            env.render(screen, cell_size=cell_size)
-            font = pygame.font.SysFont('simhei', 48)  # 使用中文字体
-            if env.winner == 1:
-                text = font.render("AI Wins!", True, (0, 0, 0))
-            elif env.winner == 2:
-                text = font.render("Player Wins!", True, (255, 0, 0))
+            env.render(screen,cell_size)
+            font=pygame.font.SysFont('simhei',48)
+            if env.winner==config.agent_player:
+                text=font.render("AI Wins!",True,(0,0,0))
+            elif env.winner is not None:
+                text=font.render("Player Wins!",True,(255,0,0))
             else:
-                text = font.render("Draw!", True, (0, 0, 255))
-
-            # 创建半透明背景
-            text_surface = pygame.Surface((text.get_width() + 20, text.get_height() + 20), pygame.SRCALPHA)
-            text_surface.fill((255, 255, 255, 128))  # 白色半透明背景
-            screen.blit(text_surface,
-                        (width // 2 - text_surface.get_width() // 2, height // 2 - text_surface.get_height() // 2))
-
-            # 居中显示文字
-            text_rect = text.get_rect(center=(width // 2, height // 2))
-            screen.blit(text, text_rect)
+                text=font.render("Draw!",True,(0,0,255))
+            t_surf=pygame.Surface((text.get_width()+20,text.get_height()+20),pygame.SRCALPHA)
+            t_surf.fill((255,255,255,128))
+            screen.blit(t_surf,(width//2-t_surf.get_width()//2,height//2-t_surf.get_height()//2))
+            text_rect=text.get_rect(center=(width//2,height//2))
+            screen.blit(text,text_rect)
             pygame.display.flip()
             pygame.time.wait(3000)
-            running = False
-
+            running=False
         clock.tick(30)
     pygame.quit()
-    sys.exit()
 
-
-# 主程序入口
-if __name__ == '__main__':
-    mode = input("请选择模式：1-训练, 2-人机对战 (训练模式将花费较长时间)：")
-    if mode.strip() == "1":
-        trained_agent = train_dqn_agent(episodes=50000)
+def main():
+    config=Config()
+    logger=Logger(config)
+    mode=input("1-Train,2-Play:")
+    if mode.strip()=="1":
+        config.save_to_json()
+        trainer=Trainer(config,logger)
+        trainer.train()
+        Plotter.plot_curve(trainer.win_rate_history,"WinRate","Test Win Rate","win_rate.png")
+        print("Train done.")
     else:
-        try:
-            trained_agent = DQNAgent(state_dim=81, action_dim=81)
-            trained_agent.model.load_state_dict(torch.load("dqn_model.pth", map_location=device))
-            trained_agent.model.eval()
-            print("模型加载成功！")
-        except FileNotFoundError:
-            print("未找到模型，正在训练...")
-            trained_agent = train_dqn_agent(episodes=50000)
-        play_game(trained_agent)
+        config.load_from_json()
+        play_game(config)
+
+if __name__=="__main__":
+    main()
